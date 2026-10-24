@@ -16,8 +16,8 @@
 //! plus a 16-byte tag. `aes256_gcm_open` returns the plaintext, or
 //! `CipherError::TagMismatch` and no plaintext, when the tag does not match.
 //!
-//! root-browser seals Linux `profile.flx` with `aes256_gcm_seal` and
-//! `aes256_gcm_open`. root-video encrypts MP4 samples with `aes128_ctr` from
+//! anvil-browser seals Linux `profile.flx` with `aes256_gcm_seal` and
+//! `aes256_gcm_open`. anvil-video encrypts MP4 samples with `aes128_ctr` from
 //! `cenc_encrypt_sample` and `cenc_decrypt_sample`. No other crate calls this
 //! one. The single-block helpers are not called by those crates. This is not
 //! a TLS stack. It has no AES-192, no CBC, no key derivation, and no nonce
@@ -74,7 +74,7 @@ impl std::error::Error for CipherError {}
 ///
 /// The return value is the ciphertext block. The schedule is 10 rounds
 /// (`Nk` = 4). This does not decrypt, and no sibling crate calls it.
-/// root-video uses `aes128_ctr` instead. The S-box lookup is not constant-time.
+/// anvil-video uses `aes128_ctr` instead. The S-box lookup is not constant-time.
 pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
     let round_keys = expand_key(key, 4, 10);
     encrypt_block(block, &round_keys, 10)
@@ -98,7 +98,7 @@ pub fn aes256_encrypt_block(key: &[u8; 32], block: &[u8; 16]) -> [u8; 16] {
 /// counter increases by one as a big-endian 128-bit integer. Each output byte
 /// is the input byte XORed with the AES-128 encryption of the current counter.
 /// Encrypt and decrypt are the same call. The output length equals the input
-/// length. Wrap of the 128-bit counter is silent. root-video calls this from
+/// length. Wrap of the 128-bit counter is silent. anvil-video calls this from
 /// `cenc_encrypt_sample` and `cenc_decrypt_sample` to encrypt MP4 samples.
 /// This path has no tag.
 pub fn aes128_ctr(key: &[u8; 16], iv: &[u8; 16], input: &[u8]) -> Vec<u8> {
@@ -125,7 +125,7 @@ pub fn aes128_ctr(key: &[u8; 16], iv: &[u8; 16], input: &[u8]) -> Vec<u8> {
 /// implemented. `aad` is authenticated and is not written into the ciphertext.
 /// The vector is the ciphertext and has the same length as `plaintext`. The
 /// array is the 16-byte tag. The first counter block is `iv` followed by the
-/// big-endian word 1. Keystream starts one 32-bit step after that. root-browser
+/// big-endian word 1. Keystream starts one 32-bit step after that. anvil-browser
 /// uses this to seal Linux `profile.flx`. No other crate calls it.
 pub fn aes256_gcm_seal(
     key: &[u8; 32],
@@ -163,7 +163,7 @@ pub fn aes256_gcm_seal(
 /// checked before any keystream byte is produced. A mismatch returns
 /// `CipherError::TagMismatch` and no plaintext. The check reads all 16 tag
 /// bytes and does not stop at the first difference. Block encryption around
-/// that check is still not constant-time. root-browser uses this to open
+/// that check is still not constant-time. anvil-browser uses this to open
 /// Linux `profile.flx`.
 pub fn aes256_gcm_open(
     key: &[u8; 32],
