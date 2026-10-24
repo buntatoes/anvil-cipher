@@ -16,3 +16,5 @@ Do not put the details in a public issue.
 - The tag compare does not stop at the first differing byte.
 
 This crate does not store keys and does not talk to the operating system.
+
+Version 0.2.0 is current.
