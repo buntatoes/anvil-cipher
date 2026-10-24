@@ -2,7 +2,7 @@
   <h1>flux-cipher</h1>
   <p>AES-128, AES-256, CTR, and AES-256-GCM.</p>
   <p>
-    <img src="https://img.shields.io/badge/release-v.01-e8c37a?style=flat-square" alt="v.01" />
+    <img src="https://img.shields.io/badge/release-v.02-e8c37a?style=flat-square" alt="v.02" />
     <img src="https://img.shields.io/badge/status-Proof_of_Concept-d4a359?style=flat-square" alt="Proof of Concept" />
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square" alt="MPL-2.0" /></a>
     <a href="./SECURITY.md"><img src="https://img.shields.io/badge/security-policy-2ea44f?style=flat-square" alt="Security" /></a>
@@ -10,7 +10,7 @@
   </p>
 </div>
 
-Version 0.1.0.
+Version 0.2.0.
 
 The browser uses AES-256-GCM for the Linux profile. [flux-video](https://github.com/buntatoes/flux-video) uses AES-128-CTR for encrypted samples. HTTPS on Linux still uses the system OpenSSL. Windows still uses Schannel and DPAPI.
 

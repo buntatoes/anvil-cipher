@@ -3,8 +3,31 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! AES-128, AES-256, CTR, and AES-256-GCM.
+//! AES-128, AES-256, AES-128-CTR, and AES-256-GCM.
+//!
+//! Keys, blocks, counters, and tags are raw bytes. Nothing here frames a
+//! message, adds padding, or chooses a nonce. `aes128_encrypt_block` takes a
+//! 16-byte key and a 16-byte block and returns the 16-byte ciphertext.
+//! `aes256_encrypt_block` does the same with a 32-byte key. There is no
+//! inverse-block function. `aes128_ctr` takes a 16-byte key, a 16-byte initial
+//! counter, and a byte string, and returns a buffer of the same length. That
+//! call both encrypts and decrypts. `aes256_gcm_seal` takes a 32-byte key, a
+//! 12-byte nonce, associated data, and plaintext, and returns the ciphertext
+//! plus a 16-byte tag. `aes256_gcm_open` returns the plaintext, or
+//! `CipherError::TagMismatch` and no plaintext, when the tag does not match.
+//!
+//! flux-browser seals Linux `profile.flx` with `aes256_gcm_seal` and
+//! `aes256_gcm_open`. flux-video encrypts MP4 samples with `aes128_ctr` from
+//! `cenc_encrypt_sample` and `cenc_decrypt_sample`. No other crate calls this
+//! one. The single-block helpers are not called by those crates. This is not
+//! a TLS stack. It has no AES-192, no CBC, no key derivation, and no nonce
+//! generator. The GCM nonce is 12 bytes only, and the tag is always 16 bytes.
+//! There is no input-length cap. The 32-bit GCM counter wraps without an error.
+//! SubBytes indexes a 256-byte table, so block encryption is not constant-time.
+//! The tag compare in `aes256_gcm_open` does read all 16 bytes before it
+//! accepts or rejects.
 
+// FIPS-197 SubBytes table. Index `b` replaces byte `b`. The lookup is data-dependent, not constant-time.
 const SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -24,16 +47,20 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
+// Key-schedule round constants. Index 0 is unused. Later entries are successive powers of x in GF(2^8).
 const RCON: [u8; 11] = [
     0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36,
 ];
 
+/// Tag failure from `aes256_gcm_open`. There is no other error variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CipherError {
+    /// Computed tag and supplied tag differ. The open call returns no plaintext.
     TagMismatch,
 }
 
 impl std::fmt::Display for CipherError {
+    /// Writes `authentication tag does not match`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TagMismatch => write!(f, "authentication tag does not match"),
@@ -43,20 +70,37 @@ impl std::fmt::Display for CipherError {
 
 impl std::error::Error for CipherError {}
 
-/// AES-128 encrypt one block.
+/// Encrypts one 16-byte block under a 16-byte AES-128 key.
+///
+/// The return value is the ciphertext block. The schedule is 10 rounds
+/// (`Nk` = 4). This does not decrypt, and no sibling crate calls it.
+/// flux-video uses `aes128_ctr` instead. The S-box lookup is not constant-time.
 pub fn aes128_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
     let round_keys = expand_key(key, 4, 10);
     encrypt_block(block, &round_keys, 10)
 }
 
-/// AES-256 encrypt one block.
+/// Encrypts one 16-byte block under a 32-byte AES-256 key.
+///
+/// The return value is the ciphertext block. The schedule is 14 rounds
+/// (`Nk` = 8). GCM uses this same forward cipher through `encrypt_block`,
+/// not through this wrapper. There is no matching decrypt function, and no
+/// sibling crate calls this wrapper.
 pub fn aes256_encrypt_block(key: &[u8; 32], block: &[u8; 16]) -> [u8; 16] {
     let round_keys = expand_key(key, 8, 14);
     encrypt_block(block, &round_keys, 14)
 }
 
-/// AES-128 in CTR mode. `iv` is the initial 16-byte counter, incremented as a
-/// big-endian integer once per block. Encrypt and decrypt are the same call.
+/// Encrypts or decrypts `input` with AES-128-CTR.
+///
+/// `key` is 16 bytes. `iv` is the initial 16-byte counter, not a 12-byte GCM
+/// nonce. After each keystream block, including a short final block, the
+/// counter increases by one as a big-endian 128-bit integer. Each output byte
+/// is the input byte XORed with the AES-128 encryption of the current counter.
+/// Encrypt and decrypt are the same call. The output length equals the input
+/// length. Wrap of the 128-bit counter is silent. flux-video calls this from
+/// `cenc_encrypt_sample` and `cenc_decrypt_sample` to encrypt MP4 samples.
+/// This path has no tag.
 pub fn aes128_ctr(key: &[u8; 16], iv: &[u8; 16], input: &[u8]) -> Vec<u8> {
     let round_keys = expand_key(key, 4, 10);
     let mut counter = *iv;
@@ -69,12 +113,20 @@ pub fn aes128_ctr(key: &[u8; 16], iv: &[u8; 16], input: &[u8]) -> Vec<u8> {
             out[offset + i] = input[offset + i] ^ stream[i];
         }
         offset += n;
+        // 128-bit big-endian add. Carry may walk from byte 15 back through byte 0.
         inc_128(&mut counter);
     }
     out
 }
 
-/// AES-256-GCM seal. `iv` is 12 bytes. Returns ciphertext and a 16-byte tag.
+/// Seals `plaintext` with AES-256-GCM.
+///
+/// `key` is 32 bytes. `iv` is 12 bytes. Other nonce lengths are not
+/// implemented. `aad` is authenticated and is not written into the ciphertext.
+/// The vector is the ciphertext and has the same length as `plaintext`. The
+/// array is the 16-byte tag. The first counter block is `iv` followed by the
+/// big-endian word 1. Keystream starts one 32-bit step after that. flux-browser
+/// uses this to seal Linux `profile.flx`. No other crate calls it.
 pub fn aes256_gcm_seal(
     key: &[u8; 32],
     iv: &[u8; 12],
@@ -86,6 +138,7 @@ pub fn aes256_gcm_seal(
     let mut j0 = [0u8; 16];
     j0[..12].copy_from_slice(iv);
     j0[15] = 1;
+    // J0 is the 12-byte nonce plus a 32-bit counter of 1. Keystream starts at J0 + 1.
     let mut counter = j0;
     inc_32(&mut counter);
     let mut body = vec![0u8; plaintext.len()];
@@ -103,7 +156,15 @@ pub fn aes256_gcm_seal(
     (body, tag)
 }
 
-/// AES-256-GCM open. Fails if the tag does not match. On failure no plaintext is returned.
+/// Opens an AES-256-GCM ciphertext.
+///
+/// `iv` is 12 bytes, the same layout as `aes256_gcm_seal`. `aad` must be the
+/// bytes that were sealed, and `tag` must be the 16-byte tag. The tag is
+/// checked before any keystream byte is produced. A mismatch returns
+/// `CipherError::TagMismatch` and no plaintext. The check reads all 16 tag
+/// bytes and does not stop at the first difference. Block encryption around
+/// that check is still not constant-time. flux-browser uses this to open
+/// Linux `profile.flx`.
 pub fn aes256_gcm_open(
     key: &[u8; 32],
     iv: &[u8; 12],
@@ -117,6 +178,7 @@ pub fn aes256_gcm_open(
     j0[..12].copy_from_slice(iv);
     j0[15] = 1;
     let expect = finish_tag(&round_keys, &h, &j0, aad, ciphertext);
+    // Reject before the keystream loop. tags_equal does not return early.
     if !tags_equal(&expect, tag) {
         return Err(CipherError::TagMismatch);
     }
@@ -136,6 +198,13 @@ pub fn aes256_gcm_open(
     Ok(plain)
 }
 
+/// Builds one GCM tag: GHASH(H, AAD, ciphertext) XORed with AES-256(K, J0).
+///
+/// `h` is the hash subkey, the encryption of a 16-byte zero block under the
+/// same round keys. `j0` is the 12-byte nonce followed by a 32-bit counter of
+/// 1. `body` is ciphertext on seal and on open. The round count passed to the
+/// block cipher is fixed at 14, because only AES-256-GCM calls this. The
+/// result is 16 bytes. AAD is covered by GHASH and does not appear in `body`.
 fn finish_tag(round_keys: &[u8], h: &[u8; 16], j0: &[u8; 16], aad: &[u8], body: &[u8]) -> [u8; 16] {
     let s = ghash(h, aad, body);
     let ek = encrypt_block(j0, round_keys, 14);
@@ -146,7 +215,15 @@ fn finish_tag(round_keys: &[u8], h: &[u8; 16], j0: &[u8; 16], aad: &[u8], body: 
     tag
 }
 
+/// Compares two 16-byte tags without stopping at the first mismatch.
+///
+/// Each pair of bytes is XORed and ORed into one accumulator. The function
+/// returns true only when that accumulator is zero, so a match and a mismatch
+/// both read all 16 bytes. This compare does not short-circuit. It is the only
+/// compare in this file written that way. The AES rounds that produce a tag
+/// still index `SBOX` and are not constant-time.
 fn tags_equal(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    // Fixed 16-byte pass. Do not return on the first differing byte.
     let mut diff = 0u8;
     for i in 0..16 {
         diff |= a[i] ^ b[i];
@@ -154,22 +231,38 @@ fn tags_equal(a: &[u8; 16], b: &[u8; 16]) -> bool {
     diff == 0
 }
 
+/// GHASH over associated data, then ciphertext, then the length block.
+///
+/// `h` is the 16-byte hash subkey. `y` starts at zero. Blocks of `aad` are
+/// absorbed first, then blocks of `body`. An empty slice adds no block. The
+/// last block is two big-endian `u64` values: the bit length of `aad`, then
+/// the bit length of `body`. That block is multiplied by `h` in GF(2^128).
+/// The returned 16 bytes are the GHASH output before the tag XOR with E(K, J0).
 fn ghash(h: &[u8; 16], aad: &[u8], body: &[u8]) -> [u8; 16] {
     let mut y = [0u8; 16];
     ghash_blocks(&mut y, h, aad);
     ghash_blocks(&mut y, h, body);
     let mut len_block = [0u8; 16];
+    // Bit lengths, not byte lengths. Each half is a big-endian u64.
     len_block[..8].copy_from_slice(&(aad.len() as u64 * 8).to_be_bytes());
     len_block[8..].copy_from_slice(&(body.len() as u64 * 8).to_be_bytes());
     xor_block(&mut y, &len_block);
     gmul(&y, h)
 }
 
+/// Folds `data` into the GHASH accumulator `y`, 16 bytes at a time.
+///
+/// Each step XORs one block into `y` and multiplies the result by `h`. A
+/// short final block is copied into a zeroed 16-byte buffer, so the unused
+/// bytes stay zero. Those pad bytes are not added to the bit length; `ghash`
+/// writes the real lengths later. An empty `data` leaves `y` unchanged.
+/// Bytes are taken from the start of `data` with no length prefix in the block.
 fn ghash_blocks(y: &mut [u8; 16], h: &[u8; 16], data: &[u8]) {
     let mut offset = 0;
     while offset < data.len() {
         let mut block = [0u8; 16];
         let n = (data.len() - offset).min(16);
+        // Tail shorter than 16 bytes stays zero-padded on the right.
         block[..n].copy_from_slice(&data[offset..offset + n]);
         xor_block(y, &block);
         *y = gmul(y, h);
@@ -177,6 +270,14 @@ fn ghash_blocks(y: &mut [u8; 16], h: &[u8; 16], data: &[u8]) {
     }
 }
 
+/// Multiplies `x` by `y` in GF(2^128) and returns the 16-byte product.
+///
+/// Both inputs are big-endian in bit order: the high bit of byte 0 is tested
+/// first. `v` starts as `y` and shifts right once per bit of `x`. When the
+/// bit of `x` is set, `v` is XORed into the product. When the bit that shifts
+/// out of `v` is 1, the reduction polynomial x^128 + x^7 + x^2 + x + 1 is
+/// folded in as the byte `0xe1` on the high end. The inner test branches on
+/// the data bits, so this multiply is not constant-time.
 fn gmul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     let mut z = [0u8; 16];
     let mut v = *y;
@@ -187,6 +288,7 @@ fn gmul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
             }
             let lsb = v[15] & 1;
             shift_right(&mut v);
+            // Bit shifted out is 1: XOR the GHASH reduction constant 0xe1.
             if lsb == 1 {
                 v[0] ^= 0xe1;
             }
@@ -195,6 +297,11 @@ fn gmul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
     z
 }
 
+/// Shifts a 16-byte block right by one bit, toward byte 15.
+///
+/// The low bit of byte `i` becomes the high bit of byte `i + 1`. The high bit
+/// of byte 0 becomes zero. The bit that leaves byte 15 is not returned. `gmul`
+/// reads `v[15] & 1` before calling this, and that bit decides the reduction.
 fn shift_right(v: &mut [u8; 16]) {
     let mut carry = 0u8;
     for byte in v.iter_mut() {
@@ -204,13 +311,23 @@ fn shift_right(v: &mut [u8; 16]) {
     }
 }
 
+/// XORs 16-byte `b` into `a` in place.
+///
+/// Byte `i` mixes with byte `i`. There is no endian swap. GHASH and the final
+/// tag XOR use this. AddRoundKey has its own loop and does not call it.
 fn xor_block(a: &mut [u8; 16], b: &[u8; 16]) {
     for i in 0..16 {
         a[i] ^= b[i];
     }
 }
 
+/// Adds one to bytes 12..16 of `counter`, as a big-endian `u32`.
+///
+/// Carry stops at byte 12. Bytes 0 through 11, the GCM nonce, are not modified.
+/// Overflow wraps inside those four bytes and does not return an error.
+/// GCM keystream blocks use this width. CTR mode uses `inc_128` instead.
 fn inc_32(counter: &mut [u8; 16]) {
+    // Indices 15, 14, 13, then 12. Byte 11 is never written.
     for i in (12..16).rev() {
         let (sum, overflow) = counter[i].overflowing_add(1);
         counter[i] = sum;
@@ -220,7 +337,14 @@ fn inc_32(counter: &mut [u8; 16]) {
     }
 }
 
+/// Adds one to the whole block as a big-endian 128-bit integer.
+///
+/// Carry may propagate from byte 15 through byte 0. Overflow wraps to all
+/// zeros and does not return an error. `aes128_ctr` calls this once per
+/// keystream block, after the XOR, including when the last chunk is shorter
+/// than 16 bytes. GCM does not call this.
 fn inc_128(counter: &mut [u8; 16]) {
+    // All 16 bytes, low byte first. Wider than the GCM counter in `inc_32`.
     for i in (0..16).rev() {
         let (sum, overflow) = counter[i].overflowing_add(1);
         counter[i] = sum;
@@ -230,6 +354,16 @@ fn inc_128(counter: &mut [u8; 16]) {
     }
 }
 
+/// Expands `key` into concatenated AES round keys.
+///
+/// `nk` is the key length in 32-bit words: 4 for AES-128, 8 for AES-256.
+/// `nr` is the round count: 10 or 14. The buffer is `16 * (nr + 1)` bytes,
+/// round 0 first, 16 bytes per round. The input key is copied to the front.
+/// Each new 4-byte word is the previous word XORed with the word `nk` words
+/// back. When the new word starts a key-sized group, the previous word is
+/// RotWord, then SubWord, then XORed with `RCON` on byte 0. For AES-256, a
+/// word that lands 16 bytes into the 32-byte group also gets SubWord alone.
+/// A bad `nk` or `nr` is not checked. Callers pass the pairs above.
 fn expand_key(key: &[u8], nk: usize, nr: usize) -> Vec<u8> {
     let total = 16 * (nr + 1);
     let mut words = vec![0u8; total];
@@ -245,6 +379,7 @@ fn expand_key(key: &[u8], nk: usize, nr: usize) -> Vec<u8> {
             prev[0] ^= RCON[rcon_i];
             rcon_i += 1;
         } else if nk > 6 && generated % (nk * 4) == 16 {
+            // AES-256 only. Nk is 8, so this is word 4 of the key. AES-128 has Nk 4 and skips this.
             sub_word(&mut prev);
         }
         for j in 0..4 {
@@ -256,6 +391,11 @@ fn expand_key(key: &[u8], nk: usize, nr: usize) -> Vec<u8> {
     words
 }
 
+/// Rotates one 4-byte schedule word left by one byte.
+///
+/// Byte 0 moves to byte 3. The other bytes move down one index. This is
+/// RotWord. It does not use `SBOX`. `expand_key` calls `sub_word` next, then
+/// XORs `RCON` into byte 0.
 fn rot_word(word: &mut [u8; 4]) {
     let first = word[0];
     word[0] = word[1];
@@ -264,12 +404,25 @@ fn rot_word(word: &mut [u8; 4]) {
     word[3] = first;
 }
 
+/// Replaces each byte of a 4-byte word with `SBOX[byte]`.
+///
+/// This is SubWord in the key schedule. The word is updated in place. The
+/// table index is the data byte, so the step is not constant-time. The cipher
+/// round uses `sub_bytes` on the full state instead of this helper.
 fn sub_word(word: &mut [u8; 4]) {
     for b in word.iter_mut() {
         *b = SBOX[*b as usize];
     }
 }
 
+/// Runs AES over one 16-byte block and returns the ciphertext state.
+///
+/// `round_keys` is the buffer from `expand_key`. `nr` is 10 for AES-128 and
+/// 14 for AES-256. State bytes stay in block order. Column `c` is the four
+/// bytes at `4 * c`. Round 0 is AddRoundKey only. Each middle round is
+/// SubBytes, ShiftRows, MixColumns, then AddRoundKey. The last round is
+/// SubBytes, ShiftRows, and AddRoundKey, with no MixColumns. No padding is
+/// added. The same forward function supplies CTR and GCM keystream.
 fn encrypt_block(block: &[u8; 16], round_keys: &[u8], nr: usize) -> [u8; 16] {
     let mut state = *block;
     add_round_key(&mut state, &round_keys[0..16]);
@@ -280,6 +433,7 @@ fn encrypt_block(block: &[u8; 16], round_keys: &[u8], nr: usize) -> [u8; 16] {
         let start = round * 16;
         add_round_key(&mut state, &round_keys[start..start + 16]);
     }
+    // Last round. MixColumns is intentionally not called.
     sub_bytes(&mut state);
     shift_rows(&mut state);
     let start = nr * 16;
@@ -287,18 +441,34 @@ fn encrypt_block(block: &[u8; 16], round_keys: &[u8], nr: usize) -> [u8; 16] {
     state
 }
 
+/// XORs one 16-byte round key into `state`.
+///
+/// State byte `i` mixes with key byte `i`. There is no rotation and no endian
+/// conversion. `key` is the 16-byte slice for this round, taken from the
+/// expanded schedule at `round * 16`.
 fn add_round_key(state: &mut [u8; 16], key: &[u8]) {
     for i in 0..16 {
         state[i] ^= key[i];
     }
 }
 
+/// Replaces every state byte with `SBOX[byte]`.
+///
+/// This is the SubBytes round step. The state is updated in place. Indexing
+/// the 256-byte table by the data is not constant-time. The key schedule uses
+/// `sub_word` for the same substitution on four bytes.
 fn sub_bytes(state: &mut [u8; 16]) {
     for b in state.iter_mut() {
         *b = SBOX[*b as usize];
     }
 }
 
+/// Rotates the AES rows of `state` to the left.
+///
+/// Bytes are stored column by column. Row 0, indices 0, 4, 8, and 12, is left
+/// as it is. Row 1 (1, 5, 9, 13) moves one byte. Row 2 (2, 6, 10, 14) moves
+/// two bytes. Row 3 (3, 7, 11, 15) moves three bytes. No byte is XORed here.
+/// A copy of the state is taken first so the rotates do not read their own writes.
 fn shift_rows(state: &mut [u8; 16]) {
     let s = *state;
     state[1] = s[5];
@@ -315,6 +485,12 @@ fn shift_rows(state: &mut [u8; 16]) {
     state[15] = s[11];
 }
 
+/// Mixes each 4-byte column as a polynomial over GF(2^8).
+///
+/// Column `c` starts at index `4 * c`. The factors are 02 and 03 from the AES
+/// MixColumns matrix. Multiply-by-02 is `xtime`. Multiply-by-03 is `xtime(b)
+/// XOR b`. The modulus is x^8 + x^4 + x^3 + x + 1. Columns do not mix with
+/// each other. `encrypt_block` skips this on the final round.
 fn mix_columns(state: &mut [u8; 16]) {
     for col in 0..4 {
         let i = col * 4;
@@ -329,8 +505,14 @@ fn mix_columns(state: &mut [u8; 16]) {
     }
 }
 
+/// Multiplies `a` by x in GF(2^8) and reduces when bit 7 was set.
+///
+/// A clear high bit is a left shift by one. A set high bit XORs `0x1b` after
+/// that shift. `0x1b` is the low byte of x^8 + x^4 + x^3 + x + 1. `mix_columns`
+/// uses this for the matrix factors 2 and 3. The branch on bit 7 follows the data.
 fn xtime(a: u8) -> u8 {
     let shifted = a << 1;
+    // Reduce only when the bit that shifted out is 1.
     if a & 0x80 == 0 {
         shifted
     } else {
@@ -340,6 +522,9 @@ fn xtime(a: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    // Locks the FIPS-197 AES-128 and AES-256 block vectors, the NIST CTR
+    // sample and decrypt-by-the-same-call, GCM round trip with a rejected
+    // tag, and the all-zero empty AES-256-GCM tag.
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
