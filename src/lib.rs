@@ -16,7 +16,7 @@
 //! plus a 16-byte tag. `aes256_gcm_open` returns the plaintext, or
 //! `CipherError::TagMismatch` and no plaintext, when the tag does not match.
 //!
-//! anvil-browser seals Linux `profile.flx` with `aes256_gcm_seal` and
+//! anvil-browser seals Linux `profile.anvil` with `aes256_gcm_seal` and
 //! `aes256_gcm_open`. anvil-video encrypts MP4 samples with `aes128_ctr` from
 //! `cenc_encrypt_sample` and `cenc_decrypt_sample`. No other crate calls this
 //! one. The single-block helpers are not called by those crates. This is not
@@ -126,7 +126,7 @@ pub fn aes128_ctr(key: &[u8; 16], iv: &[u8; 16], input: &[u8]) -> Vec<u8> {
 /// The vector is the ciphertext and has the same length as `plaintext`. The
 /// array is the 16-byte tag. The first counter block is `iv` followed by the
 /// big-endian word 1. Keystream starts one 32-bit step after that. anvil-browser
-/// uses this to seal Linux `profile.flx`. No other crate calls it.
+/// uses this to seal Linux `profile.anvil`. No other crate calls it.
 pub fn aes256_gcm_seal(
     key: &[u8; 32],
     iv: &[u8; 12],
@@ -164,7 +164,7 @@ pub fn aes256_gcm_seal(
 /// `CipherError::TagMismatch` and no plaintext. The check reads all 16 tag
 /// bytes and does not stop at the first difference. Block encryption around
 /// that check is still not constant-time. anvil-browser uses this to open
-/// Linux `profile.flx`.
+/// Linux `profile.anvil`.
 pub fn aes256_gcm_open(
     key: &[u8; 32],
     iv: &[u8; 12],

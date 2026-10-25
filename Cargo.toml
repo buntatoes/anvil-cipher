@@ -1,5 +1,5 @@
 # AES-128, AES-256, AES-128-CTR, and AES-256-GCM. No other algorithms.
-# Callers: anvil-browser (Linux profile.flx, AES-256-GCM) and anvil-video
+# Callers: anvil-browser (Linux profile.anvil, AES-256-GCM) and anvil-video
 # (MP4 sample bytes, AES-128-CTR). Not a TLS stack. publish is off.
 
 [package]
