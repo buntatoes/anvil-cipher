@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (c) 2026 Buntato
 
-//! AES-128, AES-256, AES-128-CTR, and AES-256-GCM.
+//! AES-128, AES-256, AES-128-CTR, AES-256-GCM, SHA-256, HMAC-SHA256, and HKDF-SHA256.
 //!
 //! Keys, blocks, counters, and tags are raw bytes. Nothing here frames a
 //! message, adds padding, or chooses a nonce. `aes128_encrypt_block` takes a
@@ -16,9 +16,11 @@
 //!
 //! anvil-browser seals Linux `profile.anvil` with `aes256_gcm_seal` and
 //! `aes256_gcm_open`. anvil-video encrypts MP4 samples with `aes128_ctr` from
-//! `cenc_encrypt_sample` and `cenc_decrypt_sample`. No other crate calls this
-//! one. The single-block helpers are not called by those crates. This is not
-//! a TLS stack. It has no AES-192, no CBC, no key derivation, and no nonce
+//! `cenc_encrypt_sample` and `cenc_decrypt_sample`. `anvil-net` derives TLS 1.3
+//! hybrid handshake secrets with `sha256`, `hkdf_extract`, and `hkdf_expand_label`.
+//! This is not a full TLS stack. It has no AES-192, no CBC, and no nonce
+//! generator. The GCM nonce is 12 bytes only, and the tag is always 16 bytes.
+//! The single-block helpers are not called by those crates directly.
 //! generator. The GCM nonce is 12 bytes only, and the tag is always 16 bytes.
 //! There is no input-length cap. The 32-bit GCM counter wraps without an error.
 //! SubBytes indexes a 256-byte table, so block encryption is not constant-time.
@@ -518,6 +520,168 @@ fn xtime(a: u8) -> u8 {
     }
 }
 
+/// FIPS 180-4 SHA-256 round constants.
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        let j = i * 4;
+        w[i] = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
+}
+
+/// Computes the 32-byte SHA-256 digest of `data` (FIPS 180-4).
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut chunks = data.chunks_exact(64);
+    for chunk in &mut chunks {
+        let block: &[u8; 64] = chunk.try_into().unwrap();
+        sha256_compress(&mut state, block);
+    }
+    let rem = chunks.remainder();
+    let mut tail = [0u8; 64];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = 0x80;
+    if rem.len() >= 56 {
+        sha256_compress(&mut state, &tail);
+        tail = [0u8; 64];
+    }
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    tail[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    sha256_compress(&mut state, &tail);
+    let mut out = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Computes the 32-byte HMAC-SHA256 authentication code of `data` under `key` (RFC 2104).
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha256(key);
+        key_block[..32].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let mut inner = Vec::with_capacity(64 + data.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(data);
+    let inner_hash = sha256(&inner);
+    let mut outer = [0u8; 96];
+    outer[..64].copy_from_slice(&opad);
+    outer[64..96].copy_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+/// Extracts a 32-byte pseudorandom key from `salt` and input key material `ikm`
+/// using HKDF-Extract with SHA-256 (RFC 5869 Section 2.2).
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    if salt.is_empty() {
+        hmac_sha256(&[0u8; 32], ikm)
+    } else {
+        hmac_sha256(salt, ikm)
+    }
+}
+
+/// Expands a 32-byte pseudorandom key `prk` with context `info` to `len` bytes
+/// (capped at `255 * 32`) using HKDF-Expand with SHA-256 (RFC 5869 Section 2.3).
+pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], len: usize) -> Vec<u8> {
+    let target = len.min(255 * 32);
+    let mut out = Vec::with_capacity(target);
+    let mut prev = [0u8; 32];
+    let mut prev_len = 0usize;
+    let blocks = target.div_ceil(32);
+    for i in 1..=blocks {
+        let mut msg = Vec::with_capacity(prev_len + info.len() + 1);
+        msg.extend_from_slice(&prev[..prev_len]);
+        msg.extend_from_slice(info);
+        msg.push(i as u8);
+        prev = hmac_sha256(prk, &msg);
+        prev_len = 32;
+        let take = (target - out.len()).min(32);
+        out.extend_from_slice(&prev[..take]);
+    }
+    out
+}
+
+/// TLS 1.3 `HKDF-Expand-Label` with SHA-256 (RFC 8446 Section 7.1).
+pub fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], len: u16) -> Vec<u8> {
+    let full_label_len = (6 + label.len()).min(255);
+    let ctx_len = context.len().min(255);
+    let mut info = Vec::with_capacity(2 + 1 + full_label_len + 1 + ctx_len);
+    info.extend_from_slice(&len.to_be_bytes());
+    info.push(full_label_len as u8);
+    info.extend_from_slice(b"tls13 ");
+    info.extend_from_slice(&label[..full_label_len - 6]);
+    info.push(ctx_len as u8);
+    info.extend_from_slice(&context[..ctx_len]);
+    hkdf_expand(secret, &info, usize::from(len))
+}
+
+#[cfg(test)]
+mod _noop_mod {
+    #[allow(dead_code)]
+    fn _noop() {}
+}
+
 #[cfg(test)]
 mod tests {
     // Locks the FIPS-197 AES-128 and AES-256 block vectors, the NIST CTR
@@ -597,6 +761,30 @@ mod tests {
         let (body, tag) = aes256_gcm_seal(&[0u8; 32], &[0u8; 12], b"", b"");
         assert!(body.is_empty());
         assert_eq!(hex::encode_local(&tag), "530f8afbc74536b9a963b4f1c4cb738b");
+    }
+
+    #[test]
+    fn sha256_and_hkdf_match_nist_and_rfc_5869_vectors() {
+        assert_eq!(
+            hex::encode_local(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // RFC 5869 Test Case 1
+        let ikm = [0x0bu8; 22];
+        let salt = hex("000102030405060708090a0b0c");
+        let info = hex("f0f1f2f3f4f5f6f7f8f9");
+        let prk = hkdf_extract(&salt, &ikm);
+        assert_eq!(
+            hex::encode_local(&prk),
+            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        );
+        let okm = hkdf_expand(&prk, &info, 42);
+        assert_eq!(
+            hex::encode_local(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+        let label_out = hkdf_expand_label(&prk, b"derived", &sha256(b""), 32);
+        assert_eq!(label_out.len(), 32);
     }
 
     mod hex {
