@@ -18,4 +18,4 @@ Do not put the details in a public issue.
 
 This crate does not store keys and does not talk to the operating system.
 
-Version 0.2.0 is current.
+Version 0.2.1 is current.
