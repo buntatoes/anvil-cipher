@@ -32,7 +32,7 @@ The browser uses AES-256-GCM for the Linux profile and SHA-256 / HKDF-SHA256 (`h
 cargo test
 ```
 
-Rust 2024 edition, Rust 1.85.1 or newer. No crates.io dependencies.
+Rust 2024 edition, Rust 1.99.1 or newer. No crates.io dependencies.
 
 ## The other repositories
 
