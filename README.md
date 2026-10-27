@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>anvil-cipher</h1>
+  <h1>Anvil Cipher</h1>
   <p>AES-128, AES-256, CTR, AES-256-GCM, SHA-256, HMAC-SHA256, and HKDF-SHA256.</p>
   <p>
     <img src="https://img.shields.io/badge/release-v.02-e8c37a?style=flat-square" alt="v.02" />
