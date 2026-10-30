@@ -21,7 +21,6 @@
 //! This is not a full TLS stack. It has no AES-192, no CBC, and no nonce
 //! generator. The GCM nonce is 12 bytes only, and the tag is always 16 bytes.
 //! The single-block helpers are not called by those crates directly.
-//! generator. The GCM nonce is 12 bytes only, and the tag is always 16 bytes.
 //! There is no input-length cap. The 32-bit GCM counter wraps without an error.
 //! SubBytes indexes a 256-byte table, so block encryption is not constant-time.
 //! The tag compare in `aes256_gcm_open` does read all 16 bytes before it
